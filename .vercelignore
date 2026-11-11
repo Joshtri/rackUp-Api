@@ -1,3 +1,4 @@
 # Vercel compiles on its own build machine; never upload local build output or secrets.
-target/
 .env
+bin/
+*.exe

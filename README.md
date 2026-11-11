@@ -2,27 +2,27 @@
 
 Backend untuk [RackUp](../pocket-ball-trackers): akun pengguna, riwayat main, daftar pemain, dan impor backup.
 
-Dibuat dengan Rust + [Axum](https://github.com/tokio-rs/axum), database [Neon](https://neon.com) (Postgres) lewat [sqlx](https://github.com/launchbadge/sqlx), dan di-deploy ke [Vercel](https://vercel.com/docs/functions/runtimes/rust) (Rust runtime, masih beta).
+Dibuat dengan Go (`net/http` bawaan), database [Neon](https://neon.com) (Postgres) lewat [pgx](https://github.com/jackc/pgx), dan di-deploy ke [Vercel](https://vercel.com/docs/functions/runtimes/go) (Go runtime, preset server).
 
-> **Kenapa Axum, bukan Actix?** Adapter Actix di `vercel_runtime` (v2.4.1) belum selesai: semua response body-nya kosong. Adapter Axum sudah jalan dan ada template resminya dari Vercel. Struktur folder tetap mengikuti artikel [Rust Actix Web: Structuring and Organizing an API Like a Pro](https://medium.com/@rivelbab/rust-actix-web-structuring-and-organizing-an-api-like-a-pro-790657e61ba5) (varian B).
+> **Kenapa Go, bukan Rust lagi?** Versi Rust (Axum + sqlx) susah di-deploy: Vercel memakai versi `rustc` tertentu yang tidak cocok dengan dependency terbaru. Go runtime Vercel memakai versi Go yang ditulis di `go.mod`, jadi masalah itu hilang. Perilaku API, format data, password hash, token JWT, dan tabel migrasi sama persis dengan versi Rust, jadi database dan akun yang sudah ada tetap jalan.
 
 ## Jalankan lokal
 
-Butuh Rust 1.88+ dan database Postgres (Neon atau lokal).
+Butuh Go 1.26+ dan database Postgres (Neon atau lokal).
 
 ```bash
-cp .env.example .env      # isi DATABASE_URL, DATABASE_URL_UNPOOLED, JWT_SECRET
-cargo run -- migrate      # buat tabel
-cargo run -- user create joshtri --name "Joshtri"   # buat akun (lihat "Akun")
-cargo run                 # http://localhost:8080
-cargo test                # unit test (tidak butuh database)
+cp .env.example .env                                  # isi DATABASE_URL, DATABASE_URL_UNPOOLED, JWT_SECRET
+go run ./cmd/admin migrate                            # buat tabel
+go run ./cmd/admin user create joshtri --name "Joshtri"   # buat akun (lihat "Akun")
+go run ./cmd/api                                      # http://localhost:8080
+go test ./...                                         # unit test (tidak butuh database)
 ```
 
 ## Deploy ke Vercel
 
 1. Buat database di Neon. Ambil 2 connection string: **pooled** (host ada `-pooler`) dan **direct**.
-2. Jalankan migrasi dari laptop: `cargo run -- migrate` (pakai `DATABASE_URL_UNPOOLED`). Migrasi tidak jalan otomatis saat deploy.
-3. Import repo ini di Vercel (atau `vercel deploy`). Tidak perlu setting build; Vercel mengenali `Cargo.toml` + `api/index.rs`.
+2. Jalankan migrasi dari laptop: `go run ./cmd/admin migrate` (pakai `DATABASE_URL_UNPOOLED`). Migrasi tidak jalan otomatis saat deploy.
+3. Import repo ini di Vercel (atau `vercel deploy`). `vercel.json` sudah memilih preset `go`; Vercel membangun `cmd/api/main.go` sebagai server HTTP biasa.
 4. Isi Environment Variables di Vercel: `DATABASE_URL` (pooled), `JWT_SECRET`, `CORS_ORIGINS` (domain frontend, contoh `https://rackup.vercel.app`).
    Kalau pakai integrasi Neon di Vercel Marketplace, `DATABASE_URL` dan `DATABASE_URL_UNPOOLED` terisi otomatis.
 5. Samakan region function Vercel dengan region Neon (Project → Settings → Functions) supaya query cepat.
@@ -55,11 +55,11 @@ Semua body dan response JSON. Endpoint bertanda 🔒 butuh header `Authorization
 
 Bentuk data main sama dengan tipe `Match` di frontend (`src/lib/matches.ts`): `date` format `YYYY-MM-DD`, `createdAt` dalam epoch ms, `log` hanya ada untuk main pakai shot clock. Response juga punya `updatedAt`.
 
-Error selalu berbentuk `{ "error": { "code": "...", "message": "..." } }`, contoh kode: `validation_error` (422), `unauthorized` (401), `invalid_credentials` (401), `account_expired` (401), `not_found` (404), `conflict` (409).
+Error selalu berbentuk `{ "error": { "code": "...", "message": "..." } }`, contoh kode: `validation_error` (422), `bad_request` (400/413/415/422, body atau URL tidak valid), `unauthorized` (401), `invalid_credentials` (401), `account_expired` (401), `not_found` (404), `conflict` (409).
 
 **Data bersama.** Riwayat, daftar pemain, dan sesi shot clock dipakai bersama oleh semua akun: akun mana pun bisa melihat, mengedit, dan menghapus semuanya. `matches.user_id` hanya mencatat siapa yang menyimpan.
 
-**Sesi bersama (`live_sessions`).** Server menyimpan `state` (objek `Session` dari frontend, `src/lib/session.ts`) apa adanya, dan hanya menjaga urutan perubahan lewat `version`: tiap update harus menyebut versi yang jadi dasarnya, jadi dua HP yang menekan bersamaan tidak saling menimpa (yang kalah dapat 409, ambil data terbaru, lalu terapkan ulang ketukannya). HP mengikuti perubahan dengan polling `GET ?since=` sekitar tiap 1 detik, karena function Vercel tidak bisa menahan WebSocket. Semua response sesi berisi `serverNow` (epoch ms) supaya semua HP menghitung shot clock dari jam yang sama.
+**Sesi bersama (`live_sessions`).** Server menyimpan `state` (objek `Session` dari frontend, `src/lib/session.ts`) apa adanya, dan hanya menjaga urutan perubahan lewat `version`: tiap update harus menyebut versi yang jadi dasarnya, jadi dua HP yang menekan bersamaan tidak saling menimpa (yang kalah dapat 409, ambil data terbaru, lalu terapkan ulang ketukannya). HP mengikuti perubahan dengan polling `GET ?since=` sekitar tiap 1 detik. Semua response sesi berisi `serverNow` (epoch ms) supaya semua HP menghitung shot clock dari jam yang sama.
 
 Aturan yang sama dengan frontend:
 
@@ -75,11 +75,11 @@ Batas: body request maks 4,5 MB (batas Vercel), maks 5.000 main per impor. Backu
 Tidak ada endpoint daftar (sign up). Akun dibuat admin lewat CLI, dari laptop yang punya `.env` berisi URL database:
 
 ```bash
-cargo run -- user create <username> --name "Nama Tampil" [--days 30]   # password dibuat otomatis, tampil SEKALI
-cargo run -- user list                                                  # status & tanggal kedaluwarsa
-cargo run -- user renew <username> [--days 30]                          # aktif lagi N hari dari sekarang
-cargo run -- user expire <username>                                     # akhiri sekarang
-cargo run -- user reset-password <username>                             # password baru, tampil SEKALI
+go run ./cmd/admin user create <username> --name "Nama Tampil" [--days 30]   # password dibuat otomatis, tampil SEKALI
+go run ./cmd/admin user list                                                  # status & tanggal kedaluwarsa
+go run ./cmd/admin user renew <username> [--days 30]                          # aktif lagi N hari dari sekarang
+go run ./cmd/admin user expire <username>                                     # akhiri sekarang
+go run ./cmd/admin user reset-password <username>                             # password baru, tampil SEKALI
 ```
 
 - Username huruf kecil, 3–32 karakter (`a-z 0-9 . _ -`); login tidak peduli huruf besar/kecil.
@@ -91,40 +91,22 @@ Detail alur login di frontend: [`../pocket-ball-trackers/docs/AUTH.md`](../pocke
 ## Struktur
 
 ```
-api/
-  index.rs               entrypoint Vercel (semua path di-rewrite ke sini, lihat vercel.json)
-src/
-  main.rs                server lokal + perintah `migrate`
-  lib.rs                 daftar modul
-  startup.rs             rakit app (dipakai main.rs dan api/index.rs)
-  app/
-    state.rs             AppState: pool database + settings
-    router.rs            gabung semua route, CORS, body limit, logging
-    health.rs            /health, /ready
-  config/
-    settings.rs          baca env var
-    logging.rs           tracing ke stdout
-  db/
-    connection.rs        pool Postgres (lazy, cocok untuk serverless)
-    migrations.rs        jalankan file di migrations/
-  entities/
-    user.rs              baris tabel users
-    matches.rs           baris tabel matches + tipe log shot clock
-    live_session.rs      baris tabel live_sessions
-  features/
-    auth/                login, me (Argon2id + JWT), accounts.rs = kelola akun
-  cli.rs                 perintah admin `user ...`
-    matches/             CRUD main + impor
-    players/             daftar nama pemain
-    live_sessions/       sesi shot clock bersama antar HP (versi + polling)
-  middlewares/
-    auth.rs              extractor AuthUser (cek token)
-    cors.rs              izin origin frontend
-  shared/
-    errors.rs            AppError → response JSON
-    extract.rs           Json/Path dengan error JSON
-    validation.rs        rapikan & cek input
-migrations/              file SQL (sqlx)
+cmd/
+  api/main.go            server HTTP (lokal dan Vercel)
+  admin/main.go          perintah admin: `migrate`, `user ...`
+internal/
+  app/                   gabung semua route, CORS, body limit, logging, /health, /ready
+  config/                baca env var, setup log
+  db/                    pool Postgres (lazy, cocok untuk serverless), jalankan migrasi
+  httpx/                 format error JSON, baca/tulis JSON, path param
+  validation/            rapikan & cek input
+  auth/                  login, me, users, middleware token (Argon2id + JWT), accounts.go = kelola akun
+  matches/               CRUD main + impor, tipe log shot clock
+  players/               daftar nama pemain
+  livesessions/          sesi shot clock bersama antar HP (versi + polling)
+migrations/              file SQL, ikut masuk ke binary (embed)
 ```
 
-Tiap folder di `features/` berisi `routes.rs` → `handlers.rs` → `service.rs` (aturan bisnis) → `repo.rs` (query SQL), plus `dto.rs` untuk bentuk request/response.
+Tiap folder fitur berisi `handlers.go` (HTTP) → `service.go` (aturan bisnis) → `repo.go` (query SQL), plus `dto.go` untuk bentuk request/response.
+
+Migrasi dicatat di tabel `_sqlx_migrations` dengan format yang sama seperti sqlx (versi Rust), jadi database lama tidak menjalankan ulang migrasi yang sudah ada. Migrasi baru: tambah file `migrations/<YYYYMMDDHHMMSS>_<nama>.sql`. Jangan ubah file yang sudah dijalankan; checksum-nya dicek.
