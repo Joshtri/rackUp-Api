@@ -76,9 +76,10 @@ func (h *Handlers) Me(w http.ResponseWriter, r *http.Request) error {
 	return nil
 }
 
-// Users lists active accounts, so a session's players can be linked to them.
+// Users lists the active accounts in the caller's circle (itself and its
+// friends), so a session's players can be linked to them.
 func (h *Handlers) Users(w http.ResponseWriter, r *http.Request) error {
-	users, err := listUsers(r.Context(), h.DB)
+	users, err := listCircle(r.Context(), h.DB, UserID(r.Context()))
 	if err != nil {
 		return err
 	}

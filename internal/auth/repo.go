@@ -7,6 +7,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 
+	"github.com/Joshtri/rackup-api/internal/circle"
 	"github.com/Joshtri/rackup-api/internal/db"
 )
 
@@ -77,4 +78,22 @@ func setPassword(ctx context.Context, q db.DBTX, username, passwordHash string) 
 	return scanUser(q.QueryRow(ctx,
 		"UPDATE users SET password_hash = $2 WHERE username = $1 RETURNING "+userColumns,
 		username, passwordHash))
+}
+
+// listCircle returns the account and its friends, by username.
+func listCircle(ctx context.Context, q db.DBTX, id uuid.UUID) ([]User, error) {
+	rows, err := q.Query(ctx, "SELECT "+userColumns+" FROM users WHERE id IN "+circle.Members("$1")+" ORDER BY username", id)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	users := []User{}
+	for rows.Next() {
+		u, err := scanUser(rows)
+		if err != nil {
+			return nil, err
+		}
+		users = append(users, *u)
+	}
+	return users, rows.Err()
 }

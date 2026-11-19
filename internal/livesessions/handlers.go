@@ -19,7 +19,7 @@ type Handlers struct {
 func now() int64 { return time.Now().UnixMilli() }
 
 func (h *Handlers) List(w http.ResponseWriter, r *http.Request) error {
-	sessions, err := listAll(r.Context(), h.DB)
+	sessions, err := listAll(r.Context(), h.DB, auth.UserID(r.Context()))
 	if err != nil {
 		return err
 	}
@@ -43,7 +43,7 @@ func (h *Handlers) Get(w http.ResponseWriter, r *http.Request) error {
 		n := int32(v)
 		since = &n
 	}
-	s, err := get(r.Context(), h.DB, id, since)
+	s, err := get(r.Context(), h.DB, auth.UserID(r.Context()), id, since)
 	if err != nil {
 		return err
 	}
@@ -78,7 +78,7 @@ func (h *Handlers) Update(w http.ResponseWriter, r *http.Request) error {
 	if err := httpx.DecodeJSON(r, &req); err != nil {
 		return err
 	}
-	s, err := update(r.Context(), h.DB, id, req)
+	s, err := update(r.Context(), h.DB, auth.UserID(r.Context()), id, req)
 	if err != nil {
 		return err
 	}

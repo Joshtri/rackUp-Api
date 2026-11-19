@@ -10,11 +10,13 @@ import (
 	"github.com/Joshtri/rackup-api/internal/matches"
 )
 
-// Like the history, live sessions are shared: any logged-in account can
-// follow and control any of them.
+// A session is visible to the circle (the account and its friends) of
+// whoever started it, and to the accounts linked to its players. Anyone who
+// can see it can follow and control it; to everyone else it doesn't exist (404).
+// See package circle.
 
-func listAll(ctx context.Context, pool *pgxpool.Pool) ([]sessionResponse, error) {
-	rows, err := listActive(ctx, pool)
+func listAll(ctx context.Context, pool *pgxpool.Pool, viewer uuid.UUID) ([]sessionResponse, error) {
+	rows, err := listActive(ctx, pool, viewer)
 	if err != nil {
 		return nil, err
 	}
@@ -25,8 +27,8 @@ func listAll(ctx context.Context, pool *pgxpool.Pool) ([]sessionResponse, error)
 	return out, nil
 }
 
-func mustFind(ctx context.Context, pool *pgxpool.Pool, id uuid.UUID) (sessionResponse, error) {
-	s, err := find(ctx, pool, id)
+func mustFind(ctx context.Context, pool *pgxpool.Pool, id, viewer uuid.UUID) (sessionResponse, error) {
+	s, err := find(ctx, pool, id, viewer)
 	if err != nil {
 		return sessionResponse{}, err
 	}
@@ -37,8 +39,8 @@ func mustFind(ctx context.Context, pool *pgxpool.Pool, id uuid.UUID) (sessionRes
 }
 
 // get returns the session, or nil when the caller already has version `since`.
-func get(ctx context.Context, pool *pgxpool.Pool, id uuid.UUID, since *int32) (*sessionResponse, error) {
-	s, err := mustFind(ctx, pool, id)
+func get(ctx context.Context, pool *pgxpool.Pool, viewer, id uuid.UUID, since *int32) (*sessionResponse, error) {
+	s, err := mustFind(ctx, pool, id, viewer)
 	if err != nil {
 		return nil, err
 	}
@@ -59,24 +61,24 @@ func create(ctx context.Context, pool *pgxpool.Pool, userID uuid.UUID, req creat
 	if err != nil {
 		return sessionResponse{}, false, err
 	}
-	s, err := mustFind(ctx, pool, req.ID)
+	s, err := mustFind(ctx, pool, req.ID, userID)
 	return s, created, err
 }
 
 // update saves a change made on top of req.Version.
 // 409 when another device changed the session first or it has ended: the
 // client then fetches the latest state and re-applies its tap.
-func update(ctx context.Context, pool *pgxpool.Pool, id uuid.UUID, req updateRequest) (sessionResponse, error) {
+func update(ctx context.Context, pool *pgxpool.Pool, viewer, id uuid.UUID, req updateRequest) (sessionResponse, error) {
 	state, err := validateState(req.State)
 	if err != nil {
 		return sessionResponse{}, err
 	}
-	ok, err := updateState(ctx, pool, id, req.Version, state)
+	ok, err := updateState(ctx, pool, id, viewer, req.Version, state)
 	if err != nil {
 		return sessionResponse{}, err
 	}
 	if !ok {
-		current, err := mustFind(ctx, pool, id)
+		current, err := mustFind(ctx, pool, id, viewer)
 		if err != nil {
 			return sessionResponse{}, err
 		}
@@ -85,7 +87,7 @@ func update(ctx context.Context, pool *pgxpool.Pool, id uuid.UUID, req updateReq
 		}
 		return sessionResponse{}, httpx.Conflict("this session was changed on another device")
 	}
-	return mustFind(ctx, pool, id)
+	return mustFind(ctx, pool, id, viewer)
 }
 
 // end ends a session, saving its result in the history when req.Save is set.
@@ -109,7 +111,7 @@ func end(ctx context.Context, pool *pgxpool.Pool, userID, id uuid.UUID, req endR
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
 
-	ended, found, err := lockEnded(ctx, tx, id)
+	ended, found, err := lockEnded(ctx, tx, id, userID)
 	if err != nil {
 		return sessionResponse{}, nil, err
 	}
@@ -130,7 +132,7 @@ func end(ctx context.Context, pool *pgxpool.Pool, userID, id uuid.UUID, req endR
 			return sessionResponse{}, nil, err
 		}
 	}
-	s, err := find(ctx, tx, id)
+	s, err := find(ctx, tx, id, userID)
 	if err != nil {
 		return sessionResponse{}, nil, err
 	}

@@ -11,6 +11,7 @@ import (
 
 	"github.com/Joshtri/rackup-api/internal/auth"
 	"github.com/Joshtri/rackup-api/internal/config"
+	"github.com/Joshtri/rackup-api/internal/friends"
 	"github.com/Joshtri/rackup-api/internal/httpx"
 	"github.com/Joshtri/rackup-api/internal/livesessions"
 	"github.com/Joshtri/rackup-api/internal/matches"
@@ -25,6 +26,7 @@ func New(s config.Settings, pool *pgxpool.Pool) http.Handler {
 	a := &auth.Handlers{DB: pool, Settings: s}
 	m := &matches.Handlers{DB: pool}
 	ls := &livesessions.Handlers{DB: pool}
+	fr := &friends.Handlers{DB: pool}
 	private := a.Require
 
 	mux := http.NewServeMux()
@@ -37,6 +39,12 @@ func New(s config.Settings, pool *pgxpool.Pool) http.Handler {
 	handle("POST /auth/login", a.Login)
 	handle("GET /auth/me", private(a.Me))
 	handle("GET /users", private(a.Users))
+
+	handle("GET /friends", private(fr.List))
+	handle("POST /friends/requests", private(fr.Invite))
+	handle("POST /friends/requests/{id}/accept", private(fr.Accept))
+	handle("DELETE /friends/requests/{id}", private(fr.DeleteRequest))
+	handle("DELETE /friends/{userId}", private(fr.Remove))
 
 	handle("GET /live-sessions", private(ls.List))
 	handle("POST /live-sessions", private(ls.Create))

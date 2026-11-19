@@ -10,13 +10,13 @@ import (
 )
 
 // Handlers serves /matches. Every route needs a logged-in user (see auth.Require);
-// any account can read and change every match.
+// an account sees its circle's matches and changes the ones it recorded or played in.
 type Handlers struct {
 	DB *pgxpool.Pool
 }
 
 func (h *Handlers) List(w http.ResponseWriter, r *http.Request) error {
-	out, err := listAll(r.Context(), h.DB)
+	out, err := listAll(r.Context(), h.DB, auth.UserID(r.Context()))
 	if err != nil {
 		return err
 	}
@@ -29,7 +29,7 @@ func (h *Handlers) Get(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return err
 	}
-	m, err := get(r.Context(), h.DB, id)
+	m, err := get(r.Context(), h.DB, auth.UserID(r.Context()), id)
 	if err != nil {
 		return err
 	}
@@ -68,7 +68,7 @@ func (h *Handlers) Update(w http.ResponseWriter, r *http.Request) error {
 	if err := httpx.DecodeJSON(r, &fields); err != nil {
 		return err
 	}
-	m, err := updateMatch(r.Context(), h.DB, id, fields)
+	m, err := updateMatch(r.Context(), h.DB, auth.UserID(r.Context()), id, fields)
 	if err != nil {
 		return err
 	}
@@ -81,7 +81,7 @@ func (h *Handlers) Delete(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return err
 	}
-	if err := remove(r.Context(), h.DB, id); err != nil {
+	if err := remove(r.Context(), h.DB, auth.UserID(r.Context()), id); err != nil {
 		return err
 	}
 	w.WriteHeader(http.StatusNoContent)

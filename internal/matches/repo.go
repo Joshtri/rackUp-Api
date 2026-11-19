@@ -1,7 +1,8 @@
 // Package matches is the match history: create, list, edit, delete, import a backup.
 //
-// History is shared: every account sees and edits every match.
-// `user_id` is only written on insert, to remember who saved it.
+// An account sees the matches of its circle (itself and its friends) and
+// edits the ones it recorded or played in; see package circle.
+// `user_id` is written on insert, to remember who recorded it.
 package matches
 
 import (
@@ -12,6 +13,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 
+	"github.com/Joshtri/rackup-api/internal/circle"
 	"github.com/Joshtri/rackup-api/internal/db"
 )
 
@@ -28,6 +30,16 @@ type Match struct {
 	Log       *MatchLog
 	CreatedAt time.Time
 	UpdatedAt time.Time
+	// Accounts linked to the player names, nil for guests.
+	PlayerAUser *uuid.UUID
+	PlayerBUser *uuid.UUID
+}
+
+// EditableBy reports whether the account recorded the match or played in it.
+func (m *Match) EditableBy(user uuid.UUID) bool {
+	return m.UserID == user ||
+		(m.PlayerAUser != nil && *m.PlayerAUser == user) ||
+		(m.PlayerBUser != nil && *m.PlayerBUser == user)
 }
 
 // NewMatch is a validated match ready to insert.
@@ -43,13 +55,13 @@ type NewMatch struct {
 	CreatedAt time.Time
 }
 
-const matchColumns = "id, user_id, played_on, player_a, player_b, score_a, score_b, note, log, created_at, updated_at"
+const matchColumns = "id, user_id, played_on, player_a, player_b, score_a, score_b, note, log, created_at, updated_at, player_a_user, player_b_user"
 
 func scanMatch(row pgx.Row) (*Match, error) {
 	var m Match
 	var log []byte
 	err := row.Scan(&m.ID, &m.UserID, &m.PlayedOn, &m.PlayerA, &m.PlayerB,
-		&m.ScoreA, &m.ScoreB, &m.Note, &log, &m.CreatedAt, &m.UpdatedAt)
+		&m.ScoreA, &m.ScoreB, &m.Note, &log, &m.CreatedAt, &m.UpdatedAt, &m.PlayerAUser, &m.PlayerBUser)
 	if db.NoRows(err) {
 		return nil, nil
 	}
@@ -73,8 +85,10 @@ func logParam(l *MatchLog) (any, error) {
 	return json.Marshal(l)
 }
 
-func list(ctx context.Context, q db.DBTX) ([]Match, error) {
-	rows, err := q.Query(ctx, "SELECT "+matchColumns+" FROM matches ORDER BY played_on DESC, created_at DESC")
+// list returns the matches the viewer can see, newest first.
+func list(ctx context.Context, q db.DBTX, viewer uuid.UUID) ([]Match, error) {
+	rows, err := q.Query(ctx, "SELECT "+matchColumns+" FROM matches m WHERE "+circle.MatchVisible("m", "$1")+
+		" ORDER BY played_on DESC, created_at DESC", viewer)
 	if err != nil {
 		return nil, err
 	}
@@ -94,9 +108,16 @@ func find(ctx context.Context, q db.DBTX, id uuid.UUID) (*Match, error) {
 	return scanMatch(q.QueryRow(ctx, "SELECT "+matchColumns+" FROM matches WHERE id = $1", id))
 }
 
-// findForUpdate locks the row until the transaction ends.
-func findForUpdate(ctx context.Context, q db.DBTX, id uuid.UUID) (*Match, error) {
-	return scanMatch(q.QueryRow(ctx, "SELECT "+matchColumns+" FROM matches WHERE id = $1 FOR UPDATE", id))
+// findVisible returns the match, or nil when it doesn't exist or the viewer can't see it.
+func findVisible(ctx context.Context, q db.DBTX, id, viewer uuid.UUID) (*Match, error) {
+	return scanMatch(q.QueryRow(ctx, "SELECT "+matchColumns+" FROM matches m WHERE m.id = $1 AND "+
+		circle.MatchVisible("m", "$2"), id, viewer))
+}
+
+// findVisibleForUpdate is findVisible, locking the row until the transaction ends.
+func findVisibleForUpdate(ctx context.Context, q db.DBTX, id, viewer uuid.UUID) (*Match, error) {
+	return scanMatch(q.QueryRow(ctx, "SELECT "+matchColumns+" FROM matches m WHERE m.id = $1 AND "+
+		circle.MatchVisible("m", "$2")+" FOR UPDATE", id, viewer))
 }
 
 // insert saves a match recorded by userID. Returns nil when the id already exists.
@@ -129,10 +150,10 @@ type importRow struct {
 }
 
 // insertMany inserts many matches in one round trip, recorded by userID.
-// Existing ids are skipped. Returns how many rows were added.
-func insertMany(ctx context.Context, q db.DBTX, userID uuid.UUID, ms []NewMatch) (int64, error) {
+// Existing ids are skipped. Returns the ids that were added.
+func insertMany(ctx context.Context, q db.DBTX, userID uuid.UUID, ms []NewMatch) ([]uuid.UUID, error) {
 	if len(ms) == 0 {
-		return 0, nil
+		return nil, nil
 	}
 	rows := make([]importRow, len(ms))
 	for i, m := range ms {
@@ -140,9 +161,9 @@ func insertMany(ctx context.Context, q db.DBTX, userID uuid.UUID, ms []NewMatch)
 	}
 	data, err := json.Marshal(rows)
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
-	tag, err := q.Exec(ctx,
+	res, err := q.Query(ctx,
 		`INSERT INTO matches
 		   (id, user_id, played_on, player_a, player_b, score_a, score_b, note, log, created_at)
 		 SELECT x.id, $1, x.played_on, x.player_a, x.player_b, x.score_a, x.score_b,
@@ -150,46 +171,45 @@ func insertMany(ctx context.Context, q db.DBTX, userID uuid.UUID, ms []NewMatch)
 		 FROM jsonb_to_recordset($2::jsonb) AS x(
 		   id UUID, played_on DATE, player_a TEXT, player_b TEXT, score_a INTEGER,
 		   score_b INTEGER, note TEXT, log JSONB, created_at TIMESTAMPTZ)
-		 ON CONFLICT (id) DO NOTHING`,
+		 ON CONFLICT (id) DO NOTHING
+		 RETURNING id`,
 		userID, data)
-	if err != nil {
-		return 0, err
-	}
-	return tag.RowsAffected(), nil
-}
-
-func update(ctx context.Context, q db.DBTX, id uuid.UUID, d matchData, l *MatchLog) (*Match, error) {
-	log, err := logParam(l)
 	if err != nil {
 		return nil, err
 	}
-	return scanMatch(q.QueryRow(ctx,
+	return pgx.CollectRows(res, pgx.RowTo[uuid.UUID])
+}
+
+func update(ctx context.Context, q db.DBTX, id uuid.UUID, d matchData, l *MatchLog) error {
+	log, err := logParam(l)
+	if err != nil {
+		return err
+	}
+	_, err = q.Exec(ctx,
 		`UPDATE matches
 		 SET played_on = $2, player_a = $3, player_b = $4, score_a = $5, score_b = $6,
 		     note = $7, log = $8, updated_at = now()
-		 WHERE id = $1
-		 RETURNING `+matchColumns,
-		id, d.PlayedOn, d.PlayerA, d.PlayerB, d.ScoreA, d.ScoreB, d.Note, log))
+		 WHERE id = $1`,
+		id, d.PlayedOn, d.PlayerA, d.PlayerB, d.ScoreA, d.ScoreB, d.Note, log)
+	return err
 }
 
 // renamePlayer rewrites every spelling of name that differs only in case
-// ("budi" → "Budi") across all matches.
-func renamePlayer(ctx context.Context, q db.DBTX, name string) error {
+// ("budi" → "Budi") across the matches the viewer can see.
+func renamePlayer(ctx context.Context, q db.DBTX, viewer uuid.UUID, name string) error {
 	_, err := q.Exec(ctx,
 		`UPDATE matches
 		 SET player_a = CASE WHEN lower(player_a) = lower($1) THEN $1 ELSE player_a END,
 		     player_b = CASE WHEN lower(player_b) = lower($1) THEN $1 ELSE player_b END,
 		     updated_at = now()
-		 WHERE (lower(player_a) = lower($1) AND player_a <> $1)
-		    OR (lower(player_b) = lower($1) AND player_b <> $1)`,
-		name)
+		 WHERE ((lower(player_a) = lower($1) AND player_a <> $1)
+		     OR (lower(player_b) = lower($1) AND player_b <> $1))
+		   AND `+circle.MatchVisible("matches", "$2"),
+		name, viewer)
 	return err
 }
 
-func deleteMatch(ctx context.Context, q db.DBTX, id uuid.UUID) (int64, error) {
-	tag, err := q.Exec(ctx, "DELETE FROM matches WHERE id = $1", id)
-	if err != nil {
-		return 0, err
-	}
-	return tag.RowsAffected(), nil
+func deleteMatch(ctx context.Context, q db.DBTX, id uuid.UUID) error {
+	_, err := q.Exec(ctx, "DELETE FROM matches WHERE id = $1", id)
+	return err
 }

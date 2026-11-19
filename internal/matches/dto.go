@@ -117,9 +117,12 @@ type MatchResponse struct {
 	Log       *MatchLog `json:"log,omitempty"`
 	CreatedAt int64     `json:"createdAt"`
 	UpdatedAt int64     `json:"updatedAt"`
+	// Whether the account asking may edit or delete it (it recorded or played in it).
+	CanEdit bool `json:"canEdit"`
 }
 
-func toResponse(m *Match) MatchResponse {
+// toResponse sends m as seen by viewer.
+func toResponse(m *Match, viewer uuid.UUID) MatchResponse {
 	return MatchResponse{
 		ID:        m.ID,
 		Date:      Date{m.PlayedOn},
@@ -131,6 +134,7 @@ func toResponse(m *Match) MatchResponse {
 		Log:       m.Log,
 		CreatedAt: m.CreatedAt.UnixMilli(),
 		UpdatedAt: m.UpdatedAt.UnixMilli(),
+		CanEdit:   m.EditableBy(viewer),
 	}
 }
 

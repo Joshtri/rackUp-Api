@@ -39,14 +39,19 @@ Semua body dan response JSON. Endpoint bertanda 🔒 butuh header `Authorization
 | GET | `/ready` | Status koneksi database |
 | POST | `/auth/login` | `{ username, password }` → `{ token, expiresAt, user }`. `user.expiresAt` = akhir masa aktif akun |
 | GET | `/auth/me` 🔒 | User yang sedang login |
-| GET | `/matches` 🔒 | Semua main, tanggal terbaru dulu |
+| GET | `/matches` 🔒 | Main yang boleh dilihat (punya sendiri + teman), tanggal terbaru dulu. Tiap main punya `canEdit` |
 | POST | `/matches` 🔒 | Catat main. `id` dan `createdAt` boleh dikirim (untuk batal hapus) |
 | GET | `/matches/{id}` 🔒 | Satu main |
-| PUT | `/matches/{id}` 🔒 | Edit `date, playerA, playerB, scoreA, scoreB, note` |
-| DELETE | `/matches/{id}` 🔒 | Hapus |
+| PUT | `/matches/{id}` 🔒 | Edit `date, playerA, playerB, scoreA, scoreB, note`. 403 `forbidden` kalau bukan pemain/pencatat |
+| DELETE | `/matches/{id}` 🔒 | Hapus. 403 `forbidden` kalau bukan pemain/pencatat |
 | POST | `/matches/import` 🔒 | `{ matches: [...] }` → `{ added, skipped }`. Digabung per `id`, tidak menimpa |
 | GET | `/players` 🔒 | Nama pemain, yang terakhir main paling atas |
-| GET | `/users` 🔒 | Akun yang masih aktif: `[{ id, username, displayName }]` (untuk menghubungkan pemain sesi ke akun) |
+| GET | `/users` 🔒 | Akun sendiri + teman yang masih aktif: `[{ id, username, displayName }]` (untuk menghubungkan pemain sesi ke akun) |
+| GET | `/friends` 🔒 | `{ friends, incoming, outgoing }`. Semua endpoint `/friends` membalas bentuk ini |
+| POST | `/friends/requests` 🔒 | `{ username }` → kirim undangan. Kalau dia sudah mengundang duluan, langsung berteman. 404 `user_not_found`, 409 `already_friends` |
+| POST | `/friends/requests/{id}/accept` 🔒 | Terima undangan (hanya yang diundang) |
+| DELETE | `/friends/requests/{id}` 🔒 | Tolak undangan masuk / batalkan undangan keluar |
+| DELETE | `/friends/{userId}` 🔒 | Putus teman (untuk kedua pihak) |
 | GET | `/live-sessions` 🔒 | Sesi shot clock yang sedang jalan (diubah dalam 12 jam terakhir) → `{ serverNow, sessions }` |
 | POST | `/live-sessions` 🔒 | `{ id, state }` → buat sesi. `id` dari client; diulang dengan id sama → 200 + data lama |
 | GET | `/live-sessions/{id}?since=N` 🔒 | `{ serverNow, session }`. `session` tidak dikirim kalau versinya masih `N` |
@@ -57,7 +62,13 @@ Bentuk data main sama dengan tipe `Match` di frontend (`src/lib/matches.ts`): `d
 
 Error selalu berbentuk `{ "error": { "code": "...", "message": "..." } }`, contoh kode: `validation_error` (422), `bad_request` (400/413/415/422, body atau URL tidak valid), `unauthorized` (401), `invalid_credentials` (401), `account_expired` (401), `not_found` (404), `conflict` (409).
 
-**Data bersama.** Riwayat, daftar pemain, dan sesi shot clock dipakai bersama oleh semua akun: akun mana pun bisa melihat, mengedit, dan menghapus semuanya. `matches.user_id` hanya mencatat siapa yang menyimpan.
+**Teman dan siapa melihat apa** (`internal/circle`). "Lingkaran" sebuah akun = akun itu + temannya. Pertemanan dibuat lewat undangan (`/friends`).
+
+- Nama pemain dihubungkan ke akun (`matches.player_a_user` / `player_b_user`) lewat nama tampilan atau username, tapi hanya ke akun di lingkaran si pencatat. Saat dua akun jadi teman, main lama mereka ikut dihubungkan ulang.
+- **Main** terlihat oleh akun yang lingkarannya berisi pencatat (`matches.user_id`) atau salah satu pemain yang terhubung. Hanya pencatat dan pemain yang terhubung yang boleh edit/hapus (`canEdit`). Setelah putus teman, main yang dimainkan berdua tetap terlihat oleh keduanya.
+- **Sesi live** terlihat dan bisa dikontrol oleh lingkaran pembuatnya dan akun yang terhubung ke pemainnya (`state.userA` / `userB`). Selain itu 404.
+- Daftar pemain (`/players`) dan penyeragaman ejaan nama juga hanya memakai main yang terlihat.
+- Migrasi `20261119000000_friends` menjadikan semua akun yang sudah ada saling berteman, jadi tidak ada yang kehilangan data yang sebelumnya terlihat.
 
 **Sesi bersama (`live_sessions`).** Server menyimpan `state` (objek `Session` dari frontend, `src/lib/session.ts`) apa adanya, dan hanya menjaga urutan perubahan lewat `version`: tiap update harus menyebut versi yang jadi dasarnya, jadi dua HP yang menekan bersamaan tidak saling menimpa (yang kalah dapat 409, ambil data terbaru, lalu terapkan ulang ketukannya). HP mengikuti perubahan dengan polling `GET ?since=` sekitar tiap 1 detik. Semua response sesi berisi `serverNow` (epoch ms) supaya semua HP menghitung shot clock dari jam yang sama.
 
@@ -104,6 +115,8 @@ internal/
   matches/               CRUD main + impor, tipe log shot clock
   players/               daftar nama pemain
   livesessions/          sesi shot clock bersama antar HP (versi + polling)
+  friends/               undangan   livesessions/          sesi shot clock bersama antar HP (versi + polling) daftar teman
+  circle/                aturan siapa melihat/mengedit apa (query SQL bersama)
 migrations/              file SQL, ikut masuk ke binary (embed)
 ```
 

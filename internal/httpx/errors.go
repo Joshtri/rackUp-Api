@@ -75,3 +75,8 @@ func WriteError(w http.ResponseWriter, r *http.Request, err error) {
 		"error": map[string]string{"code": e.Code, "message": e.Message},
 	})
 }
+
+// Forbidden is a 403: the user can see the thing but may not do this to it.
+func Forbidden(msg string) *Error {
+	return &Error{Status: http.StatusForbidden, Code: "forbidden", Message: msg}
+}

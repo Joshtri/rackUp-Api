@@ -9,6 +9,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/Joshtri/rackup-api/internal/circle"
 	"github.com/Joshtri/rackup-api/internal/db"
 	"github.com/Joshtri/rackup-api/internal/httpx"
 	"github.com/Joshtri/rackup-api/internal/players"
@@ -21,45 +22,46 @@ const (
 	maxRacks  = 2_000
 )
 
-// History is shared by all accounts. `userID` below is only used to record
-// who saved a match.
+// `viewer` / `userID` below is the logged-in account: it decides which
+// matches are visible and editable (see package circle), and is recorded as
+// the one who saved a new match.
 
-func listAll(ctx context.Context, pool *pgxpool.Pool) ([]MatchResponse, error) {
-	rows, err := list(ctx, pool)
+func listAll(ctx context.Context, pool *pgxpool.Pool, viewer uuid.UUID) ([]MatchResponse, error) {
+	rows, err := list(ctx, pool, viewer)
 	if err != nil {
 		return nil, err
 	}
 	out := make([]MatchResponse, len(rows))
 	for i := range rows {
-		out[i] = toResponse(&rows[i])
+		out[i] = toResponse(&rows[i], viewer)
 	}
 	return out, nil
 }
 
-func get(ctx context.Context, pool *pgxpool.Pool, id uuid.UUID) (MatchResponse, error) {
-	m, err := find(ctx, pool, id)
+func get(ctx context.Context, pool *pgxpool.Pool, viewer, id uuid.UUID) (MatchResponse, error) {
+	m, err := findVisible(ctx, pool, id, viewer)
 	if err != nil {
 		return MatchResponse{}, err
 	}
 	if m == nil {
 		return MatchResponse{}, httpx.ErrNotFound
 	}
-	return toResponse(m), nil
+	return toResponse(m, viewer), nil
 }
 
 // CreateIn saves an already validated match on q (the pool or a transaction).
-// Player names reuse an existing spelling ("budi" → "Budi"), like
-// `canonicalName` in the frontend.
+// Player names reuse a spelling the user already sees ("budi" → "Budi"),
+// like `canonicalName` in the frontend, and are linked to accounts.
 //
 // If the id already exists, the stored match is returned unchanged (so
 // undoing a delete twice is safe). created is true when a new row was added.
 func CreateIn(ctx context.Context, q db.DBTX, userID uuid.UUID, m NewMatch) (resp MatchResponse, created bool, err error) {
-	if name, ok, err := players.FindSpelling(ctx, q, m.PlayerA); err != nil {
+	if name, ok, err := players.FindSpelling(ctx, q, userID, m.PlayerA); err != nil {
 		return resp, false, err
 	} else if ok {
 		m.PlayerA = name
 	}
-	if name, ok, err := players.FindSpelling(ctx, q, m.PlayerB); err != nil {
+	if name, ok, err := players.FindSpelling(ctx, q, userID, m.PlayerB); err != nil {
 		return resp, false, err
 	} else if ok {
 		m.PlayerB = name
@@ -70,16 +72,34 @@ func CreateIn(ctx context.Context, q db.DBTX, userID uuid.UUID, m NewMatch) (res
 		return resp, false, err
 	}
 	if row != nil {
-		return toResponse(row), true, nil
+		if err := circle.LinkMatches(ctx, q, []uuid.UUID{m.ID}); err != nil {
+			return resp, false, err
+		}
+		if row, err = find(ctx, q, m.ID); err != nil {
+			return resp, false, err
+		}
+		return toResponse(row, userID), true, nil
 	}
-	existing, err := find(ctx, q, m.ID)
+	existing, err := findVisible(ctx, q, m.ID, userID)
 	if err != nil {
 		return resp, false, err
 	}
 	if existing == nil {
 		return resp, false, httpx.Conflict("this match id is already in use")
 	}
-	return toResponse(existing), false, nil
+	return toResponse(existing, userID), false, nil
+}
+
+// mustEdit returns 404 when the viewer can't see the match and 403 when they
+// can see it but didn't record it or play in it.
+func mustEdit(m *Match, viewer uuid.UUID) error {
+	if m == nil {
+		return httpx.ErrNotFound
+	}
+	if !m.EditableBy(viewer) {
+		return httpx.Forbidden("only the players and whoever recorded this match can change it")
+	}
+	return nil
 }
 
 // updateMatch edits a match, like the frontend's `update`:
@@ -87,7 +107,8 @@ func CreateIn(ctx context.Context, q db.DBTX, userID uuid.UUID, m NewMatch) (res
 //     players swapped sides;
 //   - a name typed with different capitalisation is treated as a fix and
 //     renamed across all matches.
-func updateMatch(ctx context.Context, pool *pgxpool.Pool, id uuid.UUID, fields MatchFields) (MatchResponse, error) {
+//   - only the players and whoever recorded it can edit it.
+func updateMatch(ctx context.Context, pool *pgxpool.Pool, viewer, id uuid.UUID, fields MatchFields) (MatchResponse, error) {
 	data, err := fields.validate()
 	if err != nil {
 		return MatchResponse{}, err
@@ -98,12 +119,12 @@ func updateMatch(ctx context.Context, pool *pgxpool.Pool, id uuid.UUID, fields M
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
 
-	existing, err := findForUpdate(ctx, tx, id)
+	existing, err := findVisibleForUpdate(ctx, tx, id, viewer)
 	if err != nil {
 		return MatchResponse{}, err
 	}
-	if existing == nil {
-		return MatchResponse{}, httpx.ErrNotFound
+	if err := mustEdit(existing, viewer); err != nil {
+		return MatchResponse{}, err
 	}
 	swapped := validation.SameName(data.PlayerA, existing.PlayerB) &&
 		validation.SameName(data.PlayerB, existing.PlayerA)
@@ -113,31 +134,46 @@ func updateMatch(ctx context.Context, pool *pgxpool.Pool, id uuid.UUID, fields M
 		log = &flipped
 	}
 
-	updated, err := update(ctx, tx, id, data, log)
+	if err := update(ctx, tx, id, data, log); err != nil {
+		return MatchResponse{}, err
+	}
+	if err := renamePlayer(ctx, tx, viewer, data.PlayerA); err != nil {
+		return MatchResponse{}, err
+	}
+	if err := renamePlayer(ctx, tx, viewer, data.PlayerB); err != nil {
+		return MatchResponse{}, err
+	}
+	if err := circle.LinkMatches(ctx, tx, []uuid.UUID{id}); err != nil {
+		return MatchResponse{}, err
+	}
+	updated, err := find(ctx, tx, id)
 	if err != nil {
-		return MatchResponse{}, err
-	}
-	if err := renamePlayer(ctx, tx, data.PlayerA); err != nil {
-		return MatchResponse{}, err
-	}
-	if err := renamePlayer(ctx, tx, data.PlayerB); err != nil {
 		return MatchResponse{}, err
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return MatchResponse{}, err
 	}
-	return toResponse(updated), nil
+	return toResponse(updated, viewer), nil
 }
 
-func remove(ctx context.Context, pool *pgxpool.Pool, id uuid.UUID) error {
-	n, err := deleteMatch(ctx, pool, id)
+func remove(ctx context.Context, pool *pgxpool.Pool, viewer, id uuid.UUID) error {
+	tx, err := pool.Begin(ctx)
 	if err != nil {
 		return err
 	}
-	if n == 0 {
-		return httpx.ErrNotFound
+	defer tx.Rollback(ctx) //nolint:errcheck
+
+	existing, err := findVisibleForUpdate(ctx, tx, id, viewer)
+	if err != nil {
+		return err
 	}
-	return nil
+	if err := mustEdit(existing, viewer); err != nil {
+		return err
+	}
+	if err := deleteMatch(ctx, tx, id); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
 }
 
 // importMatches merges a backup by id: existing ids are skipped, nothing is
@@ -168,10 +204,22 @@ func importMatches(ctx context.Context, pool *pgxpool.Pool, userID uuid.UUID, re
 		}
 	}
 
-	added, err := insertMany(ctx, pool, userID, rows)
+	tx, err := pool.Begin(ctx)
 	if err != nil {
 		return importResponse{}, err
 	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+	ids, err := insertMany(ctx, tx, userID, rows)
+	if err != nil {
+		return importResponse{}, err
+	}
+	if err := circle.LinkMatches(ctx, tx, ids); err != nil {
+		return importResponse{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return importResponse{}, err
+	}
+	added := int64(len(ids))
 	return importResponse{Added: added, Skipped: received - added}, nil
 }
 
